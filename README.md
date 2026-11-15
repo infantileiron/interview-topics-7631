@@ -55,6 +55,26 @@ TF=该词次数/该文档有效非停用token总数。有效文档数N，df为�
 
 主题编号是数值因子，不是语义标签。每个编号必须有唯一1—40字人工名称才能提审；管理员批准后报告固定引用该命名版本。种子中的“访谈线索一…”是模拟研究组编号，不是自动语义判断。
 
+## 离线批量跨语料检索（不经Web/数据库）
+
+逐份调用在线向量化会让 IDF 只反映单份语料、漏掉其他语料的近邻。离线入口 `src/services/batch_retrieval.py`（纯标准库，无 NumPy）接收多份语料与检索专用词典，**统一**计算全量 TF/IDF，再为每篇有效文档返回**其他语料**中最相近的三篇，用 `(corpus_id, doc_id)` 共同定位。
+
+```sh
+# 后端目录下；语料CSV列仍为 doc_id,text，--corpus 可重复传入多份
+python -m scripts.batch_retrieve \
+  --corpus batch-a=/data/interviews_a.csv \
+  --corpus batch-b=/data/interviews_b.csv \
+  --lexicon /data/retrieval_lexicon.json \
+  --output result.json --csv-output neighbors.csv \
+  --batch-size 64 --spool-dir /tmp/retrieval-spool
+```
+
+词典 JSON 为 `{"terms": [...], "stopwords": [... ]}`，规范化与校验口径与在线词典一致。也可在 Python 内调用 `run_batch_retrieval(corpora, lexicon, batch_size=...)`，语料元素支持 `{'corpus_id','rows'}` 或流式 `{'corpus_id','csv_path'}`。
+
+口径与在线实现对齐：分词沿用 NFKC/lower 后最长词表匹配（按词长分组集合查找，结果等价于线性扫描但可支撑两万词）；TF=词频/有效token总数，IDF=`ln((1+N)/(1+df))+1`，N 为全部语料有效文档总数；余弦在 TF-IDF 行 L2 归一后计算，不含自身与本语料文档；相似度 12 位四舍五入后同值按 `(corpus_id, doc_id)` 升序。无共同词项时用其他语料零相似文档按规范序补齐到三篇，其他语料有效文档不足则以 `corpus_id/doc_id=null` 的空位移交并写明原因；空词向量文档单列 `isolated` 与原因，不进入 IDF 分母或余弦。
+
+内存有界：稀疏分词记录落盘 spool，Pass2 建倒排索引、Pass3 查询分批（`--batch-size`），**不构造稠密词向量、不构造全量 N×N 矩阵**，批大小只影响内存不影响结果。结果 JSON 的 `summary` 输出 `elapsed_seconds`、分阶段用时与 `peak_rss_mb`（峰值 RSS，MiB）。实测三万篇、两万词、每篇至多二十个有效词：峰值约 71 MiB（独立子进程采样约 103 MiB），远低于 256 MiB 上限，数秒级完成。结果与输入顺序、批大小无关；小样本与直接稠密计算 oracle 逐篇一致（见 `backend/tests/`，`python3 -m unittest tests.test_batch_retrieval`，另含 `tests/bench_scale.py`、`tests/bench_invariance.py` 规模与确定性压测）。该入口只读取输入文件并另写结果，不触碰分解配额、运行记录与任何既有结果。
+
 ## 配额与失败态
 
 CSV列doc_id,text；至少2、最多600篇，每篇1—2000字符，最多80词、8主题、600次迭代。前端文件上限1.8MB，API字段上限1.8M字符；Nginx请求上限6MiB以容纳合法JSON编码开销。短行、空文本、重复ID、空有效词表/重复词/词表外停用词拒绝。全零语料或主题数超过有效维度时worker.failed，错误可见，不静默降低主题数。
